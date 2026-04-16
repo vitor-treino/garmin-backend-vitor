@@ -1,11 +1,11 @@
 """
 Garmin Connect Backend — Vitor 21K Dashboard
-Com sessão persistente para evitar erro 429 (Too Many Requests)
+Com CORS explícito para Netlify
 """
 
 import os, json, logging, pickle
 from datetime import date, timedelta, datetime
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 try:
@@ -25,62 +25,43 @@ GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD", "")
 PORT            = int(os.getenv("PORT", 5050))
 CACHE_FILE      = "/tmp/garmin_cache.json"
 SESSION_FILE    = "/tmp/garmin_session.pkl"
-CACHE_TTL_MIN   = 60  # aumentado para 60 min para reduzir logins
+CACHE_TTL_MIN   = 60
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins=["*"])
 
-# ── Sessão persistente ────────────────────────────────────────────────────────
-def get_garmin_client():
-    """
-    Reutiliza sessão salva em vez de fazer login toda vez.
-    Só faz login novo se a sessão expirar ou não existir.
-    """
-    if not GARMIN_EMAIL or not GARMIN_PASSWORD:
-        raise ValueError("Configure GARMIN_EMAIL e GARMIN_PASSWORD")
+# CORS explícito — aceita qualquer origem
+CORS(app, 
+     resources={r"/*": {"origins": "*"}},
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "OPTIONS"])
 
-    api = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+# Garante headers CORS em toda resposta
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
-    # Tenta carregar sessão salva
-    if os.path.exists(SESSION_FILE):
-        try:
-            with open(SESSION_FILE, "rb") as f:
-                saved = pickle.load(f)
-            api.session_data = saved
-            api.login(tokenstore=saved)
-            log.info("Sessao Garmin reutilizada (sem novo login)")
-            return api
-        except Exception as e:
-            log.warning(f"Sessao invalida, fazendo novo login: {e}")
-            if os.path.exists(SESSION_FILE):
-                os.remove(SESSION_FILE)
+# Responde OPTIONS (preflight) em todas as rotas
+@app.route("/<path:path>", methods=["OPTIONS"])
+@app.route("/", methods=["OPTIONS"])
+def options_handler(path=""):
+    return jsonify({"status": "ok"}), 200
 
-    # Login novo
-    log.info("Fazendo login no Garmin Connect...")
-    api.login()
-
-    # Salva sessão para próxima vez
-    try:
-        with open(SESSION_FILE, "wb") as f:
-            pickle.dump(api.session_data, f)
-        log.info("Sessao Garmin salva")
-    except Exception as e:
-        log.warning(f"Nao salvou sessao: {e}")
-
-    return api
-
-# ── Cache de dados ────────────────────────────────────────────────────────────
+# ── Cache ─────────────────────────────────────────────────────────────────────
 def load_cache():
     try:
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE) as f:
                 data = json.load(f)
-            age = (datetime.now() - datetime.fromisoformat(data.get("_cached_at","2000-01-01"))).total_seconds()/60
+            age = (datetime.now() - datetime.fromisoformat(
+                data.get("_cached_at","2000-01-01"))).total_seconds()/60
             if age < CACHE_TTL_MIN:
-                log.info(f"Cache valido ({age:.0f} min)")
+                log.info(f"Cache valido ({age:.0f}min)")
                 return data
     except:
         pass
@@ -94,6 +75,38 @@ def save_cache(data):
     except Exception as e:
         log.warning(f"Cache nao salvo: {e}")
 
+# ── Sessão Garmin ─────────────────────────────────────────────────────────────
+def get_garmin_client():
+    if not GARMIN_EMAIL or not GARMIN_PASSWORD:
+        raise ValueError("Configure GARMIN_EMAIL e GARMIN_PASSWORD")
+
+    api = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, "rb") as f:
+                saved = pickle.load(f)
+            api.session_data = saved
+            api.login(tokenstore=saved)
+            log.info("Sessao reutilizada")
+            return api
+        except Exception as e:
+            log.warning(f"Sessao invalida, novo login: {e}")
+            try: os.remove(SESSION_FILE)
+            except: pass
+
+    log.info("Novo login Garmin...")
+    api.login()
+
+    try:
+        with open(SESSION_FILE, "wb") as f:
+            pickle.dump(api.session_data, f)
+        log.info("Sessao salva")
+    except Exception as e:
+        log.warning(f"Sessao nao salva: {e}")
+
+    return api
+
 def safe(fn, *args, default=None, **kwargs):
     try:
         return fn(*args, **kwargs)
@@ -102,8 +115,7 @@ def safe(fn, *args, default=None, **kwargs):
         return default
 
 def parse_sleep(raw):
-    if not raw:
-        return []
+    if not raw: return []
     items = raw if isinstance(raw, list) else [raw]
     return [{
         "calendarDate":      s.get("calendarDate",""),
@@ -121,11 +133,10 @@ def index():
 
 @app.route("/health", methods=["GET"])
 def health():
-    session_exists = os.path.exists(SESSION_FILE)
     return jsonify({
         "status": "ok",
         "configured": bool(GARMIN_EMAIL),
-        "session_cached": session_exists
+        "session_cached": os.path.exists(SESSION_FILE)
     })
 
 @app.route("/sync", methods=["POST", "GET"])
@@ -137,13 +148,13 @@ def sync():
     try:
         api = get_garmin_client()
     except GarminConnectAuthenticationError as e:
-        return jsonify({"error": "Autenticacao falhou. Verifique email/senha.", "detail": str(e)}), 401
+        return jsonify({"error": "Autenticacao falhou.", "detail": str(e)}), 401
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         err = str(e)
         if "429" in err:
-            return jsonify({"error": "Garmin bloqueou temporariamente (429). Aguarde 30 minutos e tente novamente.", "detail": err}), 429
+            return jsonify({"error": "Garmin bloqueou (429). Aguarde 30min.", "detail": err}), 429
         return jsonify({"error": err}), 500
 
     today     = date.today()
@@ -154,7 +165,8 @@ def sync():
     data.update({
         "steps":            stats.get("totalSteps"),
         "caloriesActive":   stats.get("activeKilocalories"),
-        "intensityMinutes": (stats.get("moderateIntensityMinutes",0) or 0) + (stats.get("vigorousIntensityMinutes",0) or 0)*2,
+        "intensityMinutes": (stats.get("moderateIntensityMinutes",0) or 0) +
+                            (stats.get("vigorousIntensityMinutes",0) or 0)*2,
         "stressAvg":        stats.get("averageStressLevel"),
         "bodyBattery":      stats.get("bodyBatteryChargedValue"),
         "hrResting":        stats.get("restingHeartRate"),
@@ -162,14 +174,17 @@ def sync():
 
     vo2 = safe(api.get_max_metrics, today.isoformat())
     if vo2 and isinstance(vo2, list) and len(vo2) > 0:
-        v = vo2[0].get("generic",{}).get("vo2MaxPreciseValue") or vo2[0].get("running",{}).get("vo2MaxPreciseValue")
+        v = (vo2[0].get("generic",{}).get("vo2MaxPreciseValue") or
+             vo2[0].get("running",{}).get("vo2MaxPreciseValue"))
         if v: data["vo2max"] = round(float(v), 1)
 
     hrv = safe(api.get_hrv_data, today.isoformat())
     if hrv:
-        data["hrv"] = hrv.get("hrvSummary",{}).get("lastNight") or hrv.get("lastNight")
+        data["hrv"] = (hrv.get("hrvSummary",{}).get("lastNight") or
+                       hrv.get("lastNight"))
 
-    data["sleep"] = parse_sleep(safe(api.get_sleep_data, two_weeks.isoformat(), today.isoformat()))
+    data["sleep"] = parse_sleep(
+        safe(api.get_sleep_data, two_weeks.isoformat(), today.isoformat()))
 
     tr = safe(api.get_training_status, today.isoformat())
     if tr:
@@ -199,21 +214,17 @@ def sync():
     log.info(f"Sync OK: {len(data['activities'])} atividades")
     return jsonify(data)
 
-@app.route("/clear-cache", methods=["POST"])
+@app.route("/clear-cache", methods=["POST", "GET"])
 def clear_cache():
-    if os.path.exists(CACHE_FILE):
-        os.remove(CACHE_FILE)
+    if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
     return jsonify({"status": "cache limpo"})
 
-@app.route("/clear-session", methods=["POST"])
+@app.route("/clear-session", methods=["POST", "GET"])
 def clear_session():
-    """Use apenas se precisar forcar novo login"""
-    if os.path.exists(SESSION_FILE):
-        os.remove(SESSION_FILE)
-    if os.path.exists(CACHE_FILE):
-        os.remove(CACHE_FILE)
+    if os.path.exists(SESSION_FILE): os.remove(SESSION_FILE)
+    if os.path.exists(CACHE_FILE):   os.remove(CACHE_FILE)
     return jsonify({"status": "sessao e cache limpos"})
 
 if __name__ == "__main__":
-    print(f"\n  Garmin Backend | {GARMIN_EMAIL or 'EMAIL NAO CONFIGURADO'} | porta {PORT}\n")
+    print(f"\n  Garmin Backend | {GARMIN_EMAIL or 'NAO CONFIGURADO'} | porta {PORT}\n")
     app.run(host="0.0.0.0", port=PORT, debug=False)
