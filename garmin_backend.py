@@ -308,3 +308,65 @@ def clear_session():
 if __name__ == "__main__":
     print(f"\n  Vitor 21K Backend | Strava: {bool(STRAVA_CLIENT_ID)} | Garmin: {bool(GARMIN_EMAIL)} | porta {PORT}\n")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ROTAS DE DADOS PESSOAIS — treinos, bio, tempos (cloud sync)
+# ══════════════════════════════════════════════════════════════════
+import hashlib
+
+DATA_FILE = "/tmp/vitor_userdata.json"
+
+def load_userdata():
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE) as f:
+                return json.load(f)
+    except: pass
+    return {"completedTrainings": {}, "trainingTimes": {}, "trainingMetrics": {}, "bioData": [], "gymLogs": {}}
+
+def save_userdata(d):
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump(d, f, default=str)
+        return True
+    except Exception as e:
+        log.warning(f"Userdata nao salvo: {e}")
+        return False
+
+@app.route("/userdata", methods=["GET"])
+def get_userdata():
+    """Retorna todos os dados pessoais do usuário."""
+    return jsonify(load_userdata())
+
+@app.route("/userdata", methods=["POST"])
+def set_userdata():
+    """Salva todos os dados pessoais (merge com existente)."""
+    try:
+        incoming = request.get_json(force=True) or {}
+        current  = load_userdata()
+        # Merge inteligente por campo
+        for key in ["completedTrainings", "trainingTimes", "trainingMetrics", "gymLogs"]:
+            if key in incoming:
+                if not isinstance(current.get(key), dict):
+                    current[key] = {}
+                current[key].update(incoming[key])
+        # bioData: mantém todos, evita duplicatas por data
+        if "bioData" in incoming and isinstance(incoming["bioData"], list):
+            existing_dates = {b.get("data") for b in current.get("bioData", [])}
+            for b in incoming["bioData"]:
+                if b.get("data") not in existing_dates:
+                    current.setdefault("bioData", []).append(b)
+                    existing_dates.add(b.get("data"))
+            current["bioData"].sort(key=lambda x: x.get("data",""))
+        save_userdata(current)
+        return jsonify({"status": "ok", "saved": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/userdata/reset", methods=["POST"])
+def reset_userdata():
+    """Apaga todos os dados pessoais (use com cuidado)."""
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
+    return jsonify({"status": "resetado"})
